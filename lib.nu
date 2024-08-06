@@ -1,3 +1,15 @@
+export def xray [comment] {
+  let input = $in
+  print -en $'- ($comment): '
+  let inputtype = $in | describe
+  if $inputtype =~ '^(list|table|record)' {
+    print -e $"\n($input | table)"
+  } else {
+    print -e $"(input)"
+  }
+  $input
+}
+
 export def wrap-bin [] {
   wrap text | insert bin { |row| $row.text | into binary }
 }

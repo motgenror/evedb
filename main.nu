@@ -8,12 +8,12 @@ let types = (open sde/fsd/types.yaml
   | flatten
   | update typeID { into int }
   | update name { get en }
-  | each {
+  | par-each {
       smart-update description {
         get en? | default '<MISSING>' | str-wrap --wrap-at 10
       }
     }
-  | each {
+  | par-each {
       smart-update traits {
         smart-update roleBonuses {
           update bonusText { get en }
@@ -40,7 +40,7 @@ let attributes = (open sde/fsd/dogmaAttributes.yaml
   | transpose attributeID data
   | get data
   | reject -i tooltipDescriptionID tooltipTitleID
-  | each {
+  | par-each {
       smart-update displayNameID { get en }
       #| smart-update tooltipDescriptionID { get en }
       #| smart-update tooltipTitleID { get en }
@@ -59,7 +59,7 @@ print -e '- Loading $effects'
 let effects = (open sde/fsd/dogmaEffects.yaml
   | transpose effectid data
   | get data
-  | each {
+  | par-each {
       smart-update descriptionID { get en }
       | smart-update displayNameID { get en }
     }
@@ -70,7 +70,7 @@ let metagroups = (open sde/fsd/metaGroups.yaml
   | transpose metaGroupID data
   | update metaGroupID { into int }
   | flatten
-  | each {
+  | par-each {
       smart-update nameID { get en }
       | smart-update descriptionID { get en }
     }
@@ -81,7 +81,7 @@ let groups = (open sde/fsd/groups.yaml
   | transpose groupID data
   | update groupID { into int }
   | flatten
-  | each { smart-update name { get en } }
+  | par-each { smart-update name { get en } }
 )
 
 let units = load-units
@@ -91,7 +91,7 @@ let marketGroups = (open sde/fsd/marketGroups.yaml
   | transpose marketGroupID data
   | update marketGroupID { into int }
   | flatten
-  | each {
+  | par-each {
       smart-update descriptionID { get en }
       | smart-update nameID { get en }
     }
@@ -109,7 +109,7 @@ def resolve-market [
     [$resolved.nameID]
   }
 }
-let expiry_anchor = ('2022-01-01' | into datetime)
+let expiry_anchor = ('1970-01-01' | into datetime)
 def convert-value [unitID: int] {
   match $unitID {
     115 => { into int } # groupID
@@ -121,13 +121,13 @@ def convert-value [unitID: int] {
     139 => { into bool } # plus sign
     141 => { into int } # hardpoints
     142 => { into int } # 1=Male 2=Unisex 3=Female
-    143 => { $expiry_anchor + ($'($in)hr' | into duration) } # datetime - a weird floating value between 17k and 20k
+    143 => { $expiry_anchor + ($'($in)day' | into duration) } # days since UNIX epoch
     _ => { $in }
   }
 }
 let detailed_types = ($types
   | left-join $dogmas typeID
-  | each {
+  | par-each {
       smart-update dogmaAttributes {
         left-join $attributes attributeID
         | reject attributeID
@@ -153,7 +153,7 @@ let detailed_types = ($types
     }
   | left-join ($groups | rename -c { name: groupName } | select groupID groupName) groupID
   | left-join ($metagroups | rename -c { nameID: metaName }) metaGroupID
-  | each {
+  | par-each {
       if 'marketGroupID' in $in {
         insert market { |row| resolve-market $row.marketGroupID }
       } else {}
@@ -175,23 +175,50 @@ def from-market [
     } else { $in }
 }
 
+# List all weapons under a specific market group
 def weapons [
   marketGroupName: string = 'Turrets & Launchers'
-   --full
+  --charges (-c): closure # predicate filtering out weapons before adding charges info, one weapon record as input
+  --full
 ] {
   from-market $marketGroupName --full=$full
   | reject -i traits
-  | if not $full {
+  | if $charges != null {
+      filter $charges
+      | insert charges { |row|
+          if 'chargeSize' not-in $row.dogmaAttributes.name {
+            null
+          } else {
+            let charge_size = $row.dogmaAttributes | where name == 'chargeSize' | first | get value
+            $row.dogmaAttributes | where name =~ '^chargeGroup' | par-each { |attr|
+              let charge_group_id = $attr | get value
+              $types
+              | where groupID == $charge_group_id
+              | select typeID
+              | join $detailed_types typeID
+              | filter {
+                  get dogmaAttributes
+                  | select name value
+                  | { name: 'chargeSize' value: $charge_size } in $in
+                }
+              | update dogmaAttributes {
+                  where name =~ '^(emDamage|explosiveDamage|kineticDamage|thermalDamage|weaponRangeMultiplier|trackingSpeedMultiplier)$'
+                  | select name value
+                }
+              | select name dogmaAttributes
+              | transpose -rdi
+            }
+          }
+        }
+    } else if not $full {
       reject metaName
-    } else { $in }
-  | update dogmaAttributes {
-      if not $full {
-        where name !~ '^(requiredSkill|techLevel|metaLevelOld|typeColorScheme|chargeGroup|chargeSize).*$'
-      } else { $in }
-      | reject -i category
-      | transpose -rdi
+      | update dogmaAttributes {
+          where name !~ '^(requiredSkill|techLevel|metaLevelOld|typeColorScheme|chargeGroup|chargeSize)'
+          | select name value
+          | transpose -rdi
+        }
     }
   | flatten -a dogmaAttributes
 }
 
-print -e $'- Loaded in ((date now) - $started)'
+print -e $'- Loaded ($detailed_types | length) types in ((date now) - $started)'

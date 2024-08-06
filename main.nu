@@ -5,6 +5,7 @@ let started = date now
 print -e '- Loading $types'
 let types = (open sde/fsd/types.yaml
   | transpose typeID data
+  | where data.published == true
   | flatten
   | update typeID { into int }
   | update name { get en }
@@ -94,19 +95,24 @@ let marketGroups = (open sde/fsd/marketGroups.yaml
   | par-each {
       smart-update descriptionID { get en }
       | smart-update nameID { get en }
+      | rename -c { nameID: name }
+      | if 'descriptionID' in $in {
+          rename -c { descriptionID: description }
+        } else { $in }
     }
+  | select marketGroupID name parentGroupID?
 )
 
 print -e '- Resolving $detailed_types'
 def resolve-market [
   marketGroupID: int
 ] {
-  let resolved = $marketGroups | where marketGroupID == $marketGroupID | first | select nameID parentGroupID?
+  let resolved = $marketGroups | where marketGroupID == $marketGroupID | first | select name parentGroupID?
   
   if $resolved.parentGroupID? != null {
-    [$resolved.nameID] | prepend [(resolve-market $resolved.parentGroupID)] | flatten -a
+    [$resolved.name] | prepend [(resolve-market $resolved.parentGroupID)] | flatten -a
   } else {
-    [$resolved.nameID]
+    [$resolved.name]
   }
 }
 let expiry_anchor = ('1970-01-01' | into datetime)
@@ -155,7 +161,7 @@ let detailed_types = ($types
   | left-join ($metagroups | rename -c { nameID: metaName }) metaGroupID
   | par-each {
       if 'marketGroupID' in $in {
-        insert market { |row| resolve-market $row.marketGroupID }
+        insert market { |row| resolve-market $row.marketGroupID | str join " -> "}
       } else {}
     }
   | select typeID name groupName market? metaName description? dogmaAttributes? dogmaEffects? traits?
@@ -164,24 +170,52 @@ let detailed_types = ($types
 # UX
 
 def from-market [
-  marketGroupName: string
+  market_group_name: string # regex
   --full
+  --not
 ] {
   $detailed_types
   | where market? != null
-  | filter { $marketGroupName in $in.market }
+  | if $not {
+      where market !~ $market_group_name
+    } else {
+      where market =~ $market_group_name
+    }
   | if not $full {
-      reject -i typeID description market
+      reject -i typeID description market dogmaEffects?
     } else { $in }
 }
 
-# List all weapons under a specific market group
-def weapons [
-  marketGroupName: string = 'Turrets & Launchers'
-  --charges (-c): closure # predicate filtering out weapons before adding charges info, one weapon record as input
-  --full
+def weapon-launchers [
 ] {
-  from-market $marketGroupName --full=$full
+}
+
+def weapon-smartbombs [
+] {
+}
+
+def weapon-precursors [
+] {
+}
+
+def weapon-supers [
+] {
+}
+
+def weapon-vortons [
+] {
+}
+
+def weapon-bomblaunchers [
+] {
+}
+
+# List turrets under a specific market group
+def weapon-turrets [
+  market_group_name: string = '^Ship Equipment -> Turrets & Launchers -> (Projectile|Hybrid|Energy) Turrets' # regex
+  --charges (-c): closure # predicate filtering out weapons before adding charges info, one weapon record as input
+] {
+  from-market $market_group_name
   | reject -i traits
   | if $charges != null {
       filter $charges
@@ -192,7 +226,7 @@ def weapons [
             let charge_size = $row.dogmaAttributes | where name == 'chargeSize' | first | get value
             $row.dogmaAttributes | where name =~ '^chargeGroup' | par-each { |attr|
               let charge_group_id = $attr | get value
-              $types
+              let charges = $types
               | where groupID == $charge_group_id
               | select typeID
               | join $detailed_types typeID
@@ -201,24 +235,73 @@ def weapons [
                   | select name value
                   | { name: 'chargeSize' value: $charge_size } in $in
                 }
-              | update dogmaAttributes {
-                  where name =~ '^(emDamage|explosiveDamage|kineticDamage|thermalDamage|weaponRangeMultiplier|trackingSpeedMultiplier)$'
-                  | select name value
-                }
+              $charges | update dogmaAttributes {
+                where name in ([
+                  emDamage
+                  explosiveDamage
+                  kineticDamage
+                  thermalDamage
+                  weaponRangeMultiplier # Range Bonus (?)
+                  fallofMultiplier
+                  trackingSpeedMultiplier
+                ])
+                | select name value
+                | transpose -rdi
+              }
               | select name dogmaAttributes
-              | transpose -rdi
+              | flatten -a dogmaAttributes
             }
+            | flatten
           }
         }
-    } else if not $full {
-      reject metaName
-      | update dogmaAttributes {
-          where name !~ '^(requiredSkill|techLevel|metaLevelOld|typeColorScheme|chargeGroup|chargeSize)'
-          | select name value
-          | transpose -rdi
-        }
+    } else { $in }
+  | reject metaName
+  | update dogmaAttributes {
+      where name in ([
+        maxRange # Optimal Range
+        falloff
+        trackingSpeed
+        speed # Rate of Fire
+        reloadTime
+        damageMultiplier # Damage Modifier
+        damageMultiplierBonus # Damage Multiplier Bonus
+        overloadDamageModifier # Overload Damage Bonus
+        optimalSigRadius
+      ])
+      | select name value
+      | transpose -rdi
     }
   | flatten -a dogmaAttributes
+}
+
+def attr-value [attr_name: string] {
+  get -i $attr_name
+  | default (do {
+      let attr = $attributes | where name == $attr_name | first
+      $attr | get defaultValue | convert-value $attr.unitID
+    })
+}
+
+# Turn the output of a `weapon -c` into simulated combat stats
+def sim-turrets [] {
+  par-each { |w|
+    insert combatsim {
+      $w.charges | par-each { |c| {
+        charge: $c.name
+        damage: ([emDamage thermalDamage kineticDamage explosiveDamage] | par-each { |damage_type| {
+          $damage_type: (
+            ($c | attr-value $damage_type)
+            * ($w | attr-value damageMultiplier)
+            * ($w | attr-value damageMultiplierBonus)
+            / (($w | attr-value speed) / 1000)
+          )
+        }})
+        optimal: (($w | attr-value maxRange) * ($c | attr-value weaponRangeMultiplier))
+        falloff: (($w | attr-value falloff) * ($c | attr-value fallofMultiplier)) # fallof - not a typo
+        tracking: (($w | attr-value trackingSpeed) * ($c | attr-value trackingSpeedMultiplier))
+      }}
+    }
+  }
 }
 
 print -e $'- Loaded ($detailed_types | length) types in ((date now) - $started)'

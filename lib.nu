@@ -1,11 +1,94 @@
-export def xray [comment] {
+export def format-table [] {
+  each {
+    transpose key value
+    | update value {
+        let type = ($in | describe)
+        if $type =~ '(int|float)' {
+          format-num
+        } else if $type =~ '^table' {
+          format-table
+        } else if $type == 'list<any>' {
+          # todo
+        } else {
+          $in
+        }
+      }
+    | transpose -rdi
+  }
+}
+
+export def format-num [] {
+  let num = $in
+  def format-int [] {
+    split chars
+    | reverse
+    | chunks 3
+    | each { str join }
+    | str join ","
+    | str reverse
+  }
+  match ($num | describe) {
+    "int" => { $num | into string | format-int }
+    "float" => {
+      $num
+      | into string
+      | do {
+          let parts = $in | split row "."
+          let intpart = $parts | first
+          let floatpart = $parts | last
+          $'($intpart | format-int).($floatpart)'
+      }
+    }
+  }
+}
+
+export def load-cache [cachefile: path, varname: string, loader: closure] {
+  print -en $'- Loading ($varname)'
+  if ($cachefile | path exists) {
+    print -e ' (cached)'
+    open $cachefile
+  } else {
+    print -e ''
+    do $loader | tee { save $cachefile }
+  }
+}
+
+export def convert-value [unitID: int] {
   let input = $in
+  let expiry_anchor = ('1970-01-01' | into datetime)
+  $input | match $unitID {
+    115 => { into int } # groupID
+    116 => { into int } # typeID
+    119 => { into int } # attributeID
+    129 => { $'($in)hr' | into duration } # hours
+    136 => { into int } # slot
+    137 => { into bool } # boolean
+    139 => { into bool } # plus sign
+    141 => { into int } # hardpoints
+    142 => { into int } # 1=Male 2=Unisex 3=Female
+    143 => { $expiry_anchor + ($'($in)day' | into duration) } # days since UNIX epoch
+    _ => { $in }
+  }
+}
+
+export def xray [
+  comment
+  --length (-l) # output input's length
+] {
+  let input = $in
+
   print -en $'- ($comment): '
-  let inputtype = $in | describe
+
+  if $length {
+    print -e ($input | length | into string)
+    return $input
+  }
+
+  let inputtype = $input | describe
   if $inputtype =~ '^(list|table|record)' {
     print -e $"\n($input | table)"
   } else {
-    print -e $"(input)"
+    print -e $"($input)"
   }
   $input
 }

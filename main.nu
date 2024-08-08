@@ -126,28 +126,33 @@ let detailed_types = load-cache '.detailed_types.nuon' '$detailed_types' {||
     let traits = $in
 
     def format-bonus [] {
-      let row = $in
-        | update bonusText { str replace -ra '<a href[^>]+>([^<]+)</a>' '$1' }
-      $'($row.bonus)($units | where unitID == $row.unitID | first | get displayName) ($row.bonusText)'
+      let row = $in | update bonusText { str replace -ra '<[^>]+>([^<]+)</[^>]+>' '$1' }
+      if ('bonus' in $row) {
+        $'($row.bonus)($units | where unitID == $row.unitID | first | get displayName) ($row.bonusText)'
+      } else {
+        $'($row.bonusText)'
+      }
     }
 
     let fixed_bonuses = (
-      $traits.roleBonuses
-      | append $traits.miscBonuses
-      | each { '- Fixed: ' + ($in | format-bonus) }
+      ($traits.roleBonuses? | default [])
+      | append ($traits.miscBonuses? | default [])
+      | each { ($in | format-bonus) | if ($in | str trim | is-empty) { null } else { '- ' + $in } }
     )
     let perskill_bonuses = (
-      $traits.types
-      | join -l ($types | select name typeID | rename -c { name: skill }) typeID
-      | each { $'- Per ($in.skill): ($in | format-bonus)' }
+      if ('types' in $traits) {
+        $traits.types
+        | join -l ($types | select name typeID | rename -c { name: skill }) typeID
+        | each { $'- Per ($in.skill): ($in | format-bonus)' }
+      } else { [] }
     )
     $fixed_bonuses | append $perskill_bonuses | str join "\n" | default ''
   }
 
-  ($types #| xray -l "1"
-    | left-join $dogmas typeID #| xray -l "2"
-    | par-each {
-        smart-update dogmaAttributes {
+  ($types |
+    | left-join $dogmas typeID
+    | par-each { |type|
+        $type | smart-update dogmaAttributes {
           left-join $attributes attributeID
           | reject attributeID
           | left-join ($attribute_categories
@@ -171,17 +176,17 @@ let detailed_types = load-cache '.detailed_types.nuon' '$detailed_types' {||
             left-join $effects effectID | get effectName
           }
         | smart-update traits {
-            render-traits
+            try { render-traits } catch { print -e $"- render-traits failed for \n($type | table -ed 2)" ; exit 1 }
           }
-      } #| xray -l "3"
+      }
     | par-each {
         if 'marketGroupID' in $in {
           insert market { |row| resolve-market $row.marketGroupID | str join " -> "}
-        }
-      } #| xray -l "4"
-    | left-join ($groups | rename -c { name: group } | select groupID group) groupID #| xray -l "5"
-    | left-join ($metagroups | rename -c { nameID: metaName }) metaGroupID #| xray -l "6"
-    | select typeID name group market? metaName description? dogmaAttributes? dogmaEffects? traits? #| xray -l "7"
+        } else {}
+      }
+    | left-join ($groups | rename -c { name: group } | select groupID group) groupID
+    | left-join ($metagroups | rename -c { nameID: metaName }) metaGroupID
+    | select typeID name group market? metaName description? dogmaAttributes? dogmaEffects? traits?
   )
 }
 
@@ -332,6 +337,10 @@ def sim-turrets [] {
   }
 }
 
+const shield_res_cols = [ShEm ShTh ShKi ShEx]
+const armor_res_cols = [ArEm ArTh ArKi ArEx]
+const hull_res_cols = [HuEm HuTh HuKi HuEx]
+
 let ship_attribute_map = {
   shieldCapacity: ShHP
   shieldEmDamageResonance: ShEm
@@ -386,15 +395,62 @@ def ships [
     }
 }
 
+def move-last [colname: string] {
+  let table = $in
+  $table | move $colname --after ($table | columns | last)
+}
+
 # Add `simship` section on the output of `ships`
-def sim-ships [] {
-  insert shipsim { |ship|
-    {}
-    | insert ArRes { $ship.ArEm + $ship.ArTh + $ship.ArKi + $ship.ArEx }
-    | insert ShRes { $ship.ShEm + $ship.ShTh + $ship.ShKi + $ship.ShEx }
-    | insert ArShRes { $in.ArRes + $in.ShRes }
+def sim-ships [
+  --all
+  --shields (-s)
+  --no-shields (-S)
+  --armor (-a)
+  --no-armor (-A)
+  --hull (-h)
+  --no-hull (-H)
+  --protection (-p)
+  --mobility (-m)
+  --no-mobility (-M)
+  --dbg
+] {
+  let input = $in
+  def dbg [comment] {
+    if $dbg {
+      xray $comment
+    }
   }
-  | flatten -a shipsim
+  $input | each { |ship|
+    $ship.traits
+    | smart-parse '^- (?<percent>\d+)% bonus to all (?<target>hull|shield|armor, shield, and hull|shield and armor) resistances'
+    | append (
+        $ship.traits
+        | smart-parse '^- Per [^:]+: (?<percent>\d+)% bonus to all (?<target>hull|shield|armor|armor, shield, and hull|shield and armor) resistances'
+        | update percent { into int | $in * 5 }
+      )
+    | update percent { into int }
+    | update target { split words | filter { $in != 'and' } }
+    | flatten
+    | if ($in | is-not-empty) {
+        smart-group-by target
+        | flatten -a
+        | update target {
+            match $in {
+              "shield" => { $shield_res_cols }
+              "armor" => { $armor_res_cols }
+              "hull" => { $hull_res_cols }
+            }
+          }
+        | flatten
+        | reduce -f $ship { |bonus, ship|
+            $ship | update $bonus.target { $in + ((100 - $in) * ($bonus.percent / 100)) }
+          }
+      } else { $ship }
+    | insert ArRes { $in.ArEm + $in.ArTh + $in.ArKi + $in.ArEx }
+    | insert ShRes { $in.ShEm + $in.ShTh + $in.ShKi + $in.ShEx }
+    | insert ArShRes { $in.ArRes + $in.ShRes }
+    | move-last traits
+  }
 }
 
 print -e $'- Loaded ($detailed_types | length) types in ((date now) - $started)'

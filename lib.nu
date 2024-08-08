@@ -1,19 +1,29 @@
-export def format-table [] {
-  each {
-    transpose key value
-    | update value {
-        let type = ($in | describe)
-        if $type =~ '(int|float)' {
-          format-num
-        } else if $type =~ '^table' {
-          format-table
-        } else if $type == 'list<any>' {
-          # todo
-        } else {
-          $in
-        }
-      }
+export def smart-parse [regex] {
+  lines | each { parse -r $regex } | flatten
+}
+
+export def format-any [] {
+  let input = $in
+  let type = ($input | describe)
+  if $type =~ '^(int|float)$' {
+    print -e '1'
+    $input | format-num
+  } else if $type =~ '^(table|list<any>)' {
+    print -e '2'
+    $input | each {
+      transpose key value
+      | update value { format-any }
+      | transpose -rdi
+    }
+  } else if $type =~ '^record' {
+    print -e '3'
+    $input
+    | transpose key value
+    | update value { format-any }
     | transpose -rdi
+  } else {
+    print -e '4'
+    $input
   }
 }
 
@@ -71,6 +81,10 @@ export def convert-value [unitID: int] {
   }
 }
 
+export def catch-errors [] {
+  collect
+}
+
 export def xray [
   comment
   --length (-l) # output input's length
@@ -95,6 +109,27 @@ export def xray [
 
 export def wrap-bin [] {
   wrap text | insert bin { |row| $row.text | into binary }
+}
+
+export def smart-group-by [colname] {
+  group-by { get $colname } --to-table | rename -c { group: $colname } | update items { reject $colname } | sort-by -r $colname
+}
+
+export def column-types [] {
+  # Thanks @Cheer at the Nushell Discord
+  describe -d
+  | flatten -a
+  | get values
+  | flatten
+  | where type == record
+  | get columns
+  | uniq
+  | update cells {
+      if ($in | describe | str starts-with 'record') {
+        get type
+      } else {}
+    }
+  | transpose column type
 }
 
 export def str-wrap [
